@@ -7,6 +7,7 @@ This page covers the math and the configurable algorithmic components: the algor
 - [The Algorithm Abstraction](#the-algorithm-abstraction)
   - [Model References](#model-references)
   - [The Algorithms](#the-algorithms)
+  - [SFT Sources](#sft-sources)
   - [Customizing Components](#customizing-components)
   - [Per-Env Algorithms](#per-env-algorithms)
   - [The Algorithm Classes](#the-algorithm-classes)
@@ -30,14 +31,14 @@ This page covers the math and the configurable algorithmic components: the algor
 
 A training algorithm in `prime-rl` is configured under `[orchestrator.algo]`, where **`type` names the algorithm** (`grpo`, `opd`, `sft`, …) and the class defaults are its vetted setting. It has two parts:
 
-1. **Sampling** (`algo.sampling`) — how train rollouts are produced: which model generates them. `source` is a [model reference](#model-references): `"policy"` (the live policy, the default) or an inline frozen hosted model. Group sizing stays on the env config (`group_size`).
+1. **Sampling** (`algo.sampling`) — how train rollouts are produced. `source` is `"policy"` (the live policy, the default), an inline frozen hosted model, or a static supervised dataset. Group sizing stays on the env config (`group_size`).
 2. **The per-token training signal** — credit assignment and loss routing, fused; the algorithm's own parameters sit directly on `algo`. One mapping from a finalized rollout to per-token *(loss component, weight)* pairs — the credit a token gets and the loss that consumes it are two coordinates of the same output. Group-relative algorithms compute credit on the orchestrator and ship per-token advantage streams; reference-KL algorithms query a reference model at batch-ship time (bounded concurrency) and ship its prefill logprobs for the trainer to evaluate against the live policy. The `type` determines which loss component consumes the action tokens (`rl` / `ce` / `ref_kl`) and what happens to env-provided observation tokens in multi-turn rollouts (masked out by default; `echo` trains on them with weighted CE).
 
 The trainer is algorithm-blind: the loss is a sum of three components (rl, ce, ref_kl), each normalized by its own global token count; per-token streams ship on the wire (the `rl_weights` / `ce_weights` / `ref_kl_weights` component weights plus the `advantages` stream on each training sample) and the trainer just executes them. Adding an algorithm never touches the dispatcher, packer, or trainer hot path.
 
 ### Model References
 
-`prime-rl` hosts exactly one model: the trainable policy (`[orchestrator.model]`). Every other model an algorithm uses is an external OpenAI-compatible endpoint, declared *inline on the component that uses it*. A model reference is either the string `"policy"` (the live policy) or a frozen hosted model (`name` + `base_url`):
+`prime-rl` hosts exactly one model: the trainable policy (`[orchestrator.model]`). Every other model an algorithm uses is an external OpenAI-compatible endpoint, declared *inline on the component that uses it*. A model reference is either the string `"policy"` (the live policy) or a frozen hosted model (`name` + `base_url`); static datasets are rollout sources, not model references:
 
 ```toml
 [orchestrator.algo]
@@ -50,9 +51,9 @@ base_url = ["http://localhost:8001/v1"]
 
 Model *roles* are labels the algorithm itself declares over these references — the distillation algorithms declare their reference's role as `teacher`, so `[orchestrator.algo.teacher]` is the shorthand for that slot and validation errors speak the same language ("algorithm 'opd' needs a teacher"). No role exists outside the algorithm that declares it: the dispatcher, sink, and trainer branch on liveness alone, never on what an algorithm calls a model.
 
-`algo.teacher` is shorthand for the slot the algorithm declares for its reference — `algo.model` for `opd` / `opsd`, `sampling.source` for `sft` (its teacher is the sampling source). A slot you didn't set takes the shorthand; an explicit reference that already equals it is accepted, a disagreeing one is an error. For `opd` / `opsd` you can also set `algo.model` directly; set the component fields directly for multi-model setups.
+`algo.teacher` is shorthand for the slot the algorithm declares for its reference — `algo.model` for `opd` / `opsd`, `sampling.source` for `sft`'s frozen-teacher form. A slot you didn't set takes the shorthand; an explicit reference that already equals it is accepted, a disagreeing one is an error. For `opd` / `opsd` you can also set `algo.model` directly; set `algo.sampling.source` directly for dataset sources and multi-model setups.
 
-Liveness is a property of the reference, not of any role: rollouts sampled from `"policy"` get version-salted prefix caches, carry sampling logprobs for importance ratios, and age off-policy as weights update; rollouts and scores from frozen models get a stable prefix cache and never go stale. Frozen models are externally hosted (`base_url` is required) — `prime-rl` never launches or updates them, and each env's algorithm builds its own client pool to the endpoints it declares.
+Liveness is a property of the source, not of any role: rollouts sampled from `"policy"` get version-salted prefix caches, carry sampling logprobs for importance ratios, and age off-policy as weights update; rollouts and scores from frozen models get a stable prefix cache and never go stale; dataset-sourced rollouts are local message replay with no env or client. Frozen models are externally hosted (`base_url` is required) — `prime-rl` never launches or updates them, and each env's algorithm builds its own client pool to the endpoints it declares.
 
 ### The Algorithms
 
@@ -68,11 +69,44 @@ type = "grpo"  # the default
 | `grpo` | policy | `rl` on actions | Standard group-relative RL. |
 | `max_rl` | policy | `rl` on actions | MaxRL ([arXiv:2602.02710](https://arxiv.org/abs/2602.02710)): GRPO's centered reward normalized by the group **mean** instead of the standard deviation — the gradient is unbiased for the order-`group_size` truncation of the maximum-likelihood objective, upweighting hard examples like `1/p`. |
 | `opd` | policy | `ref_kl` on actions | On-policy distillation ([Thinking Machines](https://thinkingmachines.ai/blog/on-policy-distillation/)): the policy samples, per-token reverse KL against a reference model as the gradient signal. Needs a `teacher`. |
-| `sft` | *(the teacher)* | `ce` on actions | Hard distillation: a frozen model generates rollouts, the policy trains with CE on its tokens. Needs a `teacher` (folds into `sampling.source`). |
+| `sft` | *(teacher or dataset)* | `ce` on actions | Supervised fine-tuning: CE on a non-policy source's target tokens. Source picks the flavor — a frozen `teacher` model (distillation on fresh rollouts) or a static `dataset` (replay of stored traces). Assigns no credit. |
 | `opsd` | policy | `ref_kl` on actions | SDFT ([arXiv:2601.19897](https://arxiv.org/abs/2601.19897)): the model is its own reference, conditioned on an expert demonstration. Defaults to the live policy (the paper's setting, no extra deployment); set an inline `model` to score under a frozen copy instead. |
 | `echo` | policy | `rl` on actions + weighted `ce` on observations | ECHO: standard GRPO plus a cross-entropy loss on env-provided tokens already present in the rollout, selected by message role (needs the renderer's role attribution). Defaults to tool-response bodies at `alpha = 0.1` (ECHO's λ); set `roles` to train other roles, each at its own weight. |
 | `reward` | policy | `rl` on actions | REINFORCE-style: advantage = raw reward, no group baseline. |
 | `custom` | policy | `rl` on actions | Your own advantage function (`import_path`), per-token advantages per rollout — see [Custom Advantage](#custom-advantage). |
+
+#### SFT Sources
+
+`sft` always trains cross-entropy on non-policy target tokens. A frozen teacher source samples those targets from an externally hosted model:
+
+```toml
+[orchestrator.algo]
+type = "sft"
+
+[orchestrator.algo.teacher]  # alias for sampling.source on sft
+name = "teacher-model"
+base_url = ["http://teacher:8000/v1"]
+```
+
+A static dataset source replays stored targets locally. Set `type = "dataset"` explicitly so the source table is read as a dataset, not a model reference:
+
+```toml
+[orchestrator.algo]
+type = "sft"
+
+[orchestrator.algo.sampling.source]
+type = "dataset"
+name = "org/my-sft-dataset"
+split = "train"
+# optional: subset, max_examples, messages_column, prompt_column, completion_column, tools_column
+
+[[orchestrator.train.env]]
+id = "static-sft"
+name = "static-sft"
+group_size = 1
+```
+
+Static dataset rows use either a `messages` column or `prompt` + `completion` columns. The dataset path does not start a Verifiers env or select a model client.
 
 ### Customizing Components
 
@@ -111,7 +145,7 @@ kwargs = { patterns = ["WARNING"] }
 def drop_warnings(rollout, *, patterns: list[str]) -> list[list[bool]]: ...
 ```
 
-Component compatibility is validated at config time: frozen-model sampling can only feed the `ce` loss component — the `rl` and `ref_kl` components need the live policy's own sampling logprobs for importance ratios — `opd` pointed at `"policy"` is rejected as degenerate (zero KL), `sft` without a frozen source is rejected (CE on the policy's own tokens is not a distillation target). A group-relative algorithm with `group_size = 1` produces all-zero advantages; the resulting empty batch is caught at runtime (the orchestrator warns and aborts after repeated zero-trainable batches), not at config time.
+Component compatibility is validated at config time: non-policy sampling can only feed the `ce` loss component — the `rl` and `ref_kl` components need the live policy's own sampling logprobs for importance ratios — `opd` pointed at `"policy"` is rejected as degenerate (zero KL), and `sft` with the policy as its source is rejected (CE on the policy's own tokens is not a supervision target). A group-relative algorithm with `group_size = 1` produces all-zero advantages; the resulting empty batch is caught at runtime (the orchestrator warns and aborts after repeated zero-trainable batches), not at config time.
 
 ### Per-Env Algorithms
 
@@ -140,7 +174,7 @@ At runtime, each env's resolved config builds two objects: a `Sampler` (`prime_r
 | `max_rl` | `MaxRLAlgorithm` | `score_group`: mean-normalized group credit |
 | `opd` | `OPDAlgorithm` | `score_batch`: own-context prefill under the teacher |
 | `opsd` | `OPSDAlgorithm` | `score_batch`: demo-conditioned prefill under the teacher |
-| `sft` | `SFTDistillAlgorithm` | `score_group`: group-norm credit (feeds filters) |
+| `sft` | `SFTAlgorithm` | *(no hook — CE on the source's target tokens, no credit)* |
 | `reward` | `RewardAlgorithm` | `score_rollout`: raw reward |
 | `custom` | `CustomAlgorithm` | `score_group`: your function |
 
@@ -178,7 +212,7 @@ $$
 $$
 
 - `rl` — the configured RL loss (`[trainer.loss]`): DPPO + KL by default, or a [custom loss](#custom-loss). Fed by the group-relative advantage strategies (`grpo`, `max_rl`, `reward`, `custom`, and `echo`'s action tokens).
-- `ce` — masked NLL. Used for frozen-model tokens (`sft`) and env-observation tokens (`echo`).
+- `ce` — masked NLL. Used for supervised target tokens (`sft`) and env-observation tokens (`echo`).
 - `ref_kl` — the per-token reverse KL to a reference model ($\log \pi_{\text{ref}} - \log \pi$) as the policy-gradient signal, importance-ratio corrected with a one-sided trust region (`opd`, `opsd`). Requires `ref_logprobs` from a [reference scoring](#reference-scoring); the scoring model must be a vLLM server (it's the only one that exposes `prompt_logprobs`).
 
 The orchestrator stamps each sample's component membership as per-token weight streams (`rl_weights` / `ce_weights` / `ref_kl_weights` on the wire): a weight scales that component's per-token loss, `0.0` leaves the token out of the component entirely (mask *and* denominator), and components may overlap on the same token — their gradients sum. Each $N$ is the global (all-reduced) count of that component's member tokens, so the components don't dilute each other: adding echo observation tokens never changes the rl term's effective per-token learning rate, and an sft env packed next to a GRPO env doesn't soften its gradient. Tokens of different components pack freely into the same micro batch, and a plain GRPO run ships no weight streams at all (absent streams mean rl weight 1.0 on every trainable token — the unchanged hot path). Advantages always ship per token (`advantages` on the wire), assigned as per-token streams from the start — uniform group credit is broadcast over completion tokens at assignment; algorithms with no rl credit (opd, opsd) ship none.
@@ -283,7 +317,7 @@ The per-token training signal is set by `algo.type` and the [algorithm](#the-alg
 | `reward` | `rl` | Advantage = raw reward, no baseline. |
 | `opd` | `ref_kl` | On-policy distillation: per-token reverse KL to a reference model (`model`, an inline frozen hosted model), evaluated in the trainer from shipped reference logprobs. No credit — rollouts keep `advantages = None` (advantage-based filters never fire) and ship no advantage stream; `group_size` only fans out sampling. |
 | `opsd` | `ref_kl` | SDFT: per-token reverse KL to a demo-conditioned reference. No credit — rollouts keep `advantages = None` (advantage-based filters never fire) and ship no advantage stream. |
-| `sft` | `ce` | Cross-entropy on the sampled tokens. Assigns no advantage — trains on every sampled token. |
+| `sft` | `ce` | Cross-entropy on the source's target tokens (a frozen teacher's rollouts or a static dataset's traces). Assigns no advantage — trains on every target token. |
 | `custom` | `rl` | Your function (below); per-token advantages per rollout. |
 
 ### Default Advantage

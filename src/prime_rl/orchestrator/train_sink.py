@@ -28,6 +28,35 @@ from prime_rl.transport import TrainingSample
 from prime_rl.utils.logger import get_logger
 
 
+def _token_usage_from_samples(samples: list[TrainingSample]) -> dict[str, float]:
+    input_tokens = 0
+    output_tokens = 0
+    for sample in samples:
+        output_tokens += sum(sample.completion_mask)
+        input_tokens += len(sample.prompt_ids) + len(sample.completion_mask) - sum(sample.completion_mask)
+    return {
+        "input_tokens": float(input_tokens),
+        "output_tokens": float(output_tokens),
+        "final_input_tokens": float(input_tokens),
+        "final_output_tokens": float(output_tokens),
+    }
+
+
+def _fill_final_token_usage_from_samples(raw: dict, samples: list[TrainingSample]) -> None:
+    derived = _token_usage_from_samples(samples)
+    usage = raw.get("token_usage")
+    if not isinstance(usage, dict):
+        raw["token_usage"] = derived
+        return
+
+    for key in ("input_tokens", "output_tokens"):
+        if usage.get(key) is None:
+            usage[key] = derived[key]
+    for key in ("final_input_tokens", "final_output_tokens"):
+        if usage.get(key) is None or (usage[key] == 0 and derived[key] > 0):
+            usage[key] = derived[key]
+
+
 class TrainSink:
     """Three-level train sink. Constructed once, fed via ``add(rollout)``."""
 
@@ -151,6 +180,9 @@ class TrainSink:
             mm_token_type_ids_mapping=self.mm_token_type_ids_mapping,
         )
         rollout.samples = samples or []
+        # Static/message-only rollouts carry no final context counts; recover
+        # them from finalized samples without clobbering API usage totals.
+        _fill_final_token_usage_from_samples(raw, rollout.samples)
         # Arrival phase: rollout-local scoring (raw reward, echo observation
         # weighting) runs as soon as the rollout is tokenized — before its
         # group is complete.

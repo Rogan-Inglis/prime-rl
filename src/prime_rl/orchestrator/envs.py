@@ -29,9 +29,11 @@ from typing import Generic, TypeVar
 import verifiers.v1 as vf
 from verifiers.v1.serve import EnvClient
 
+from prime_rl.configs.algorithm import StaticDatasetConfig
 from prime_rl.configs.orchestrator import EnvConfig, EvalEnvConfig, TrainEnvConfig
 from prime_rl.orchestrator.algo import Algorithm, build_algorithm
 from prime_rl.orchestrator.sampler import Sampler
+from prime_rl.orchestrator.static_sft import load_static_sft_rows, static_sft_rollout
 from prime_rl.orchestrator.types import Rollout
 from prime_rl.utils.logger import get_logger
 
@@ -208,6 +210,27 @@ class TrainEnv(Env):
         self.sampler = sampler
         self.algorithm = algorithm
         self.sampling_args = sampler.sampling_args(config.sampling.to_sampling_args())
+
+    async def start(
+        self,
+        log_dir: Path,
+        log_level: str | None = None,
+        json_logging: bool = False,
+    ) -> None:
+        if self.sampler.source_kind == "dataset":
+            return
+        await super().start(log_dir=log_dir, log_level=log_level, json_logging=json_logging)
+
+    def get_dataset(self, seed: int | None = None):
+        source = self.sampler.config.source
+        if isinstance(source, StaticDatasetConfig):
+            return load_static_sft_rows(source, seed=seed)
+        raise NotImplementedError("get_dataset is only supported for static dataset sources")
+
+    async def run_static_rollout(self, example: dict) -> vf.RolloutOutput:
+        source = self.sampler.config.source
+        assert isinstance(source, StaticDatasetConfig)
+        return static_sft_rollout(example, source, sampling_args=self.sampling_args)
 
 
 class EvalEnv(Env):
